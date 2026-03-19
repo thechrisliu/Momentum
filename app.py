@@ -370,42 +370,72 @@ def train_models(ml_df):
     y_train, y_test = y[:split], y[split:]
     tscv = TimeSeriesSplit(n_splits=5)
 
-    models = {
-        "Ridge": Pipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=1.0))]),
-        "Random Forest": RandomForestRegressor(
-            n_estimators=100, max_depth=5, random_state=SEED, n_jobs=-1
+    base_models = {
+        "Ridge": Pipeline([("scaler", StandardScaler()), ("model", Ridge())]),
+        "Random Forest": Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                ("model", RandomForestRegressor(random_state=SEED, n_jobs=-1)),
+            ]
         ),
-        "XGBoost": xgb.XGBRegressor(
-            n_estimators=200,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            random_state=SEED,
-            n_jobs=-1,
-            verbosity=0,
+        "XGBoost": Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                ("model", xgb.XGBRegressor(random_state=SEED, n_jobs=-1, verbosity=0)),
+            ]
         ),
     }
+    param_grids = {
+        "Ridge": {"model__alpha": [0.01, 0.1, 1.0, 10.0, 100.0]},
+        "Random Forest": {
+            "model__n_estimators": [50, 100, 200],
+            "model__max_depth": [3, 5, 7, None],
+            "model__max_features": ["sqrt", "log2", 0.5],
+        },
+        "XGBoost": {
+            "model__n_estimators": [100, 200, 300],
+            "model__max_depth": [3, 4, 5],
+            "model__learning_rate": [0.01, 0.05, 0.1],
+            "model__subsample": [0.7, 0.8, 1.0],
+            "model__colsample_bytree": [0.7, 0.8, 1.0],
+        },
+    }
     results = {}
-    for name, model in models.items():
-        cv = cross_val_score(
-            model, X_train, y_train, cv=tscv, scoring="neg_mean_absolute_error"
+    tuning_log = {}
+    for name, base in base_models.items():
+        search = RandomizedSearchCV(
+            base,
+            param_distributions=param_grids[name],
+            n_iter=20,
+            cv=tscv,
+            scoring="neg_mean_absolute_error",
+            random_state=SEED,
+            n_jobs=-1,
+            refit=True,
         )
-        model.fit(X_train, y_train)
-        pred = model.predict(X_test)
+        search.fit(X_train, y_train)
+        best = search.best_estimator_
+        pred = best.predict(X_test)
+        cv_means = -search.cv_results_["mean_test_score"]
+        tuning_log[name] = cv_means
         results[name] = {
-            "model": model,
+            "model": best,
             "pred": pred,
-            "cv_mae": -cv.mean(),
+            "cv_mae": -search.best_score_,
+            "best_params": search.best_params_,
             "test_mae": mean_absolute_error(y_test, pred),
             "test_r2": r2_score(y_test, pred),
+            "cv_scores": cv_means,
         }
+        print(f"  {name} best params: {search.best_params_}")
     naive_pred = ml_df["ret_1m"].values[split:]
     results["Naive"] = {
         "test_mae": mean_absolute_error(y_test, naive_pred),
         "test_r2": r2_score(y_test, naive_pred),
         "cv_mae": None,
+        "cv_scores": None,
     }
-    return results, X_test, y_test, split
+    return results, X_test, y_test, split, tuning_log
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -456,12 +486,20 @@ else:
 
 # ── ML models ──────────────────────────────────────────────────────────────────────────
 _cached_models = _cache.get("ml_models")
+if _cached_models is not None and "cv_scores" not in _cached_models[0].get("Ridge", {}):
+    print("Stale ML cache detected — rebuilding with tuning…")
+    _cache.delete("ml_models")
+    _cached_models = None
+
 if _cached_models is not None:
     print("Loading ML models from cache…")
     ml_results, X_test, y_test, split_idx = _cached_models
+    tuning_log = {
+        n: ml_results[n]["cv_scores"] for n in ["Ridge", "Random Forest", "XGBoost"]
+    }
 else:
     print("Training ML models…")
-    ml_results, X_test, y_test, split_idx = train_models(ml_df)
+    ml_results, X_test, y_test, split_idx, tuning_log = train_models(ml_df)
     _cache.set("ml_models", (ml_results, X_test, y_test, split_idx), expire=CACHE_TTL)
 
 xgb_model = ml_results["XGBoost"]["model"]
@@ -484,6 +522,35 @@ app = dash.Dash(
     external_stylesheets=[dbc.themes.DARKLY],
     title="Momentum Investing Dashboard",
 )
+
+# --- ADD THIS BLOCK ---
+# This overrides the base HTML template to inject our custom CSS
+app.index_string = """
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            /* Forces the slider tooltip text to be dark so it's visible */
+            .rc-slider-tooltip-inner { 
+                color: #141622 !important; 
+                font-weight: bold;
+            }
+        </style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+"""
 
 # ── Colour tokens ─────────────────────────────────────────────────────────────
 BG_CARD = "#1e2130"
@@ -551,9 +618,23 @@ sidebar = html.Div(
             style={"backgroundColor": "#1e2130", "color": TXT_MAIN},
         ),
         html.Br(),
-        html.Label(
-            "Portfolio Size",
-            style={"color": TXT_MUTE, "fontSize": "12px", "fontWeight": "600"},
+        html.Div(
+            [
+                html.Span(
+                    "Portfolio Size",
+                    style={"color": TXT_MUTE, "fontSize": "12px", "fontWeight": "600"},
+                ),
+                html.Span(
+                    "20 stocks",
+                    id="n-stocks-val",
+                    style={
+                        "color": ACCENT,
+                        "fontSize": "13px",
+                        "fontWeight": "700",
+                        "marginLeft": "8px",
+                    },
+                ),
+            ]
         ),
         dcc.Slider(
             id="n-stocks",
@@ -562,12 +643,25 @@ sidebar = html.Div(
             step=5,
             value=20,
             marks={v: str(v) for v in [5, 10, 20, 30, 50]},
-            tooltip={"placement": "bottom"},
         ),
         html.Br(),
-        html.Label(
-            "Lookback (months)",
-            style={"color": TXT_MUTE, "fontSize": "12px", "fontWeight": "600"},
+        html.Div(
+            [
+                html.Span(
+                    "Lookback (months)",
+                    style={"color": TXT_MUTE, "fontSize": "12px", "fontWeight": "600"},
+                ),
+                html.Span(
+                    "12 mo",
+                    id="lookback-val",
+                    style={
+                        "color": ACCENT,
+                        "fontSize": "13px",
+                        "fontWeight": "700",
+                        "marginLeft": "8px",
+                    },
+                ),
+            ]
         ),
         dcc.Slider(
             id="lookback-m",
@@ -576,7 +670,6 @@ sidebar = html.Div(
             step=1,
             value=12,
             marks={v: str(v) for v in [1, 3, 6, 9, 12, 18]},
-            tooltip={"placement": "bottom"},
         ),
         html.Br(),
         html.Label(
@@ -814,6 +907,16 @@ app.layout = html.Div(
 # ─────────────────────────────────────────────────────────────────────────────
 # Callbacks
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@app.callback(
+    Output("n-stocks-val", "children"),
+    Output("lookback-val", "children"),
+    Input("n-stocks", "value"),
+    Input("lookback-m", "value"),
+)
+def update_slider_labels(n, lb):
+    return f"{n} stocks", f"{lb} mo"
 
 
 @app.callback(
@@ -1541,6 +1644,68 @@ def tab_ml():
         page_size=10,
     )
 
+    # ── Tuning trajectory ──────────────────────────────────────────────────────
+    fig4 = go.Figure()
+    tune_colors = {"Ridge": GREEN, "Random Forest": PURPLE, "XGBoost": BLUE}
+    for name, scores in tuning_log.items():
+        if scores is None:
+            continue
+        fig4.add_trace(
+            go.Scatter(
+                x=list(range(1, len(scores) + 1)),
+                y=scores,
+                mode="lines+markers",
+                name=name,
+                line=dict(color=tune_colors.get(name, GREY), width=2),
+                marker=dict(size=5),
+            )
+        )
+    fig4.update_layout(
+        **PLOTLY_LAYOUT,
+        title="Hyperparameter Tuning — CV MAE Across RandomizedSearchCV Candidates",
+        xaxis_title="Candidate #",
+        yaxis_title="CV MAE",
+        height=300,
+    )
+
+    # ── Best params table ─────────────────────────────────────────────────────
+    param_rows = []
+    for name in ["Ridge", "Random Forest", "XGBoost"]:
+        for k, v in ml_results[name].get("best_params", {}).items():
+            param_rows.append(
+                {
+                    "Model": name,
+                    "Parameter": k.replace("model__", ""),
+                    "Best Value": str(v),
+                }
+            )
+    param_df = pd.DataFrame(param_rows)
+    param_tbl = dash_table.DataTable(
+        data=param_df.to_dict("records"),
+        columns=[{"name": c, "id": c} for c in param_df.columns],
+        style_table={"overflowX": "auto"},
+        style_header={
+            "backgroundColor": "#252840",
+            "color": TXT_MAIN,
+            "fontWeight": "700",
+            "border": "none",
+            "fontSize": "12px",
+        },
+        style_cell={
+            "backgroundColor": BG_CARD,
+            "color": TXT_MAIN,
+            "border": "1px solid #2a2f45",
+            "fontSize": "12px",
+            "textAlign": "left",
+            "padding": "8px",
+        },
+        style_data_conditional=[
+            {"if": {"filter_query": '{Model} = "XGBoost"'}, "color": BLUE},
+            {"if": {"filter_query": '{Model} = "Random Forest"'}, "color": PURPLE},
+            {"if": {"filter_query": '{Model} = "Ridge"'}, "color": GREEN},
+        ],
+    )
+
     return html.Div(
         [
             dbc.Row(
@@ -1548,7 +1713,7 @@ def tab_ml():
                     dbc.Col(
                         card(dcc.Graph(figure=fig1, config={"displayModeBar": False})),
                         md=12,
-                    ),
+                    )
                 ]
             ),
             dbc.Row(
@@ -1560,6 +1725,30 @@ def tab_ml():
                     dbc.Col(
                         card(dcc.Graph(figure=fig3, config={"displayModeBar": False})),
                         md=6,
+                    ),
+                ]
+            ),
+            dbc.Row(
+                [
+                    dbc.Col(
+                        card(dcc.Graph(figure=fig4, config={"displayModeBar": False})),
+                        md=8,
+                    ),
+                    dbc.Col(
+                        card(
+                            [
+                                html.P(
+                                    "🏆 Best Hyperparameters",
+                                    style={
+                                        "color": ACCENT,
+                                        "fontWeight": "700",
+                                        "marginBottom": "8px",
+                                    },
+                                ),
+                                param_tbl,
+                            ]
+                        ),
+                        md=4,
                     ),
                 ]
             ),
@@ -1575,6 +1764,118 @@ def tab_ml():
                     ),
                     tbl,
                 ]
+            ),
+            card(
+                html.Div(
+                    [
+                        html.P(
+                            "⚠️ Limitations & Critical Reflection",
+                            style={
+                                "color": AMBER,
+                                "fontWeight": "700",
+                                "marginBottom": "10px",
+                                "fontSize": "15px",
+                            },
+                        ),
+                        dbc.Row(
+                            [
+                                dbc.Col(
+                                    [
+                                        html.P(
+                                            "Data & Methodology",
+                                            style={
+                                                "color": TXT_MAIN,
+                                                "fontWeight": "600",
+                                                "marginBottom": "6px",
+                                            },
+                                        ),
+                                        html.Ul(
+                                            [
+                                                html.Li(
+                                                    "Survivorship bias: the S&P 500 constituent list reflects today’s survivors. Stocks delisted or removed historically are excluded, overstating returns."
+                                                ),
+                                                html.Li(
+                                                    "Transaction costs & market impact are not modelled. Monthly rebalancing of 20 stocks incurs bid-ask spreads and slippage, particularly for less liquid names."
+                                                ),
+                                                html.Li(
+                                                    "The 70% data availability threshold is pragmatic — tickers with sparse data may still introduce look-ahead bias through forward-fill."
+                                                ),
+                                            ],
+                                            style={
+                                                "color": TXT_MUTE,
+                                                "fontSize": "12px",
+                                            },
+                                        ),
+                                    ],
+                                    md=4,
+                                ),
+                                dbc.Col(
+                                    [
+                                        html.P(
+                                            "ML Model Caveats",
+                                            style={
+                                                "color": TXT_MAIN,
+                                                "fontWeight": "600",
+                                                "marginBottom": "6px",
+                                            },
+                                        ),
+                                        html.Ul(
+                                            [
+                                                html.Li(
+                                                    "Low R² (~0.01–0.03) across all models reflects the near-unpredictability of individual stock returns. The models capture a small but potentially exploitable signal."
+                                                ),
+                                                html.Li(
+                                                    "Features are lagged returns and volatility — likely correlated across stocks in the same month, violating i.i.d. assumptions. TimeSeriesSplit mitigates but does not eliminate this."
+                                                ),
+                                                html.Li(
+                                                    "Overfitting risk: RandomizedSearchCV with 20 candidates × 5 folds is reasonable but limited. SHAP values would provide deeper interpretability."
+                                                ),
+                                            ],
+                                            style={
+                                                "color": TXT_MUTE,
+                                                "fontSize": "12px",
+                                            },
+                                        ),
+                                    ],
+                                    md=4,
+                                ),
+                                dbc.Col(
+                                    [
+                                        html.P(
+                                            "Next Steps for Validation",
+                                            style={
+                                                "color": TXT_MAIN,
+                                                "fontWeight": "600",
+                                                "marginBottom": "6px",
+                                            },
+                                        ),
+                                        html.Ul(
+                                            [
+                                                html.Li(
+                                                    "Use point-in-time S&P 500 constituent data (e.g. Compustat) to eliminate survivorship bias and re-run the backtest."
+                                                ),
+                                                html.Li(
+                                                    "Incorporate transaction cost estimates (~10–20bps round-trip) to assess net-of-cost alpha."
+                                                ),
+                                                html.Li(
+                                                    "Add SHAP beeswarm plots to decompose individual predictions and verify the model learns genuine momentum signals."
+                                                ),
+                                                html.Li(
+                                                    "Extend the ML ranker to use predicted return as a portfolio weight rather than equal-weight top-N."
+                                                ),
+                                            ],
+                                            style={
+                                                "color": TXT_MUTE,
+                                                "fontSize": "12px",
+                                            },
+                                        ),
+                                    ],
+                                    md=4,
+                                ),
+                            ]
+                        ),
+                    ]
+                )
             ),
         ]
     )
