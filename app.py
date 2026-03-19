@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-import joblib
 from bs4 import BeautifulSoup
 
 from sklearn.linear_model import Ridge
@@ -215,7 +214,8 @@ class MomentumStrategy:
     def calculate_risk_adjusted_momentum(self, prices, date):
         w = self._window(prices, date)
         log_ret = np.log(w / w.shift(1)).dropna()
-        if len(log_ret) < 60:
+        min_obs = max(20, int(self.lookback_long * 0.3))  # scale min obs with lookback
+        if len(log_ret) < min_obs:
             return pd.Series(dtype=float)
         ann_ret = log_ret.mean() * 252
         ann_vol = log_ret.std() * np.sqrt(252)
@@ -224,6 +224,9 @@ class MomentumStrategy:
     def calculate_composite_momentum(self, prices, date):
         horizons = [21, 63, 126, 252]
         weights = [0.20, 0.30, 0.30, 0.20]
+        # Only use horizons that fit within the configured lookback window
+        horizons = [h for h in horizons if h <= self.lookback_long]
+        weights = weights[: len(horizons)]
         idx = prices.index.get_indexer([date], method="ffill")[0]
         signals = []
         for h in horizons:
@@ -271,6 +274,8 @@ class MomentumStrategy:
             tickers = self.select_stocks(prices, signal_date, method=method)
             if not tickers:
                 continue
+            # Note: entry at signal_date closing price — assumes same-day execution.
+            # A stricter implementation would enter at signal_date+1 to avoid look-ahead.
             hold = prices.loc[signal_date:hold_end, tickers]
             ret_m = hold.pct_change().mean(axis=1)
             total_r = (1 + ret_m).prod() - 1
@@ -448,7 +453,9 @@ strategy = MomentumStrategy()
 METHODS = ["classic", "risk_adjusted", "composite", "volatility_filtered"]
 
 # ── Backtests ───────────────────────────────────────────────────────────────────────────────
-_cached_bt = _cache.get("backtest_results")
+# Cache version — increment this if backtest logic changes to force recompute
+CACHE_VERSION = "v2"
+_cached_bt = _cache.get(f"backtest_results_{CACHE_VERSION}")
 if _cached_bt is not None:
     print("Loading backtests from cache…")
     results, all_stats, all_holdings = _cached_bt
@@ -464,7 +471,11 @@ else:
     all_stats["S&P 500"] = strategy._calc_stats(
         bench_m, bench_eq, bench_returns["SP500"]
     )
-    _cache.set("backtest_results", (results, all_stats, all_holdings), expire=CACHE_TTL)
+    _cache.set(
+        f"backtest_results_{CACHE_VERSION}",
+        (results, all_stats, all_holdings),
+        expire=CACHE_TTL,
+    )
 
 bench_m = bench_returns["SP500"].resample("ME").apply(lambda x: (1 + x).prod() - 1)
 bench_eq = (1 + bench_m).cumprod()
@@ -771,8 +782,8 @@ app.layout = html.Div(
                             },
                         ),
                         html.P(
-                            f"S&P 500 · {prices.index[0].date()} → {prices.index[-1].date()} · "
-                            f"{prices.shape[1]} clean tickers",
+                            id="header-subtitle",
+                            children=f"S&P 500 · {prices.index[0].date()} → {prices.index[-1].date()} · {prices.shape[1]} clean tickers · lookback: 12m · {NUM_STOCKS} stocks",
                             style={
                                 "color": TXT_MUTE,
                                 "fontSize": "13px",
@@ -926,7 +937,7 @@ def update_slider_labels(n, lb):
 )
 def refresh_data(n_clicks):
     _cache.delete("sp500_prices")
-    _cache.delete("backtest_results")
+    _cache.delete(f"backtest_results_{CACHE_VERSION}")
     _cache.delete("ml_dataset")
     _cache.delete("ml_models")
     return "✅ All caches cleared — restart app to re-download."
@@ -935,6 +946,7 @@ def refresh_data(n_clicks):
 @app.callback(
     Output("kpi-row", "children"),
     Output("tab-content", "children"),
+    Output("header-subtitle", "children"),
     Input("run-btn", "n_clicks"),
     Input("tabs", "value"),
     Input("compare-methods", "value"),
@@ -949,10 +961,18 @@ def update_dashboard(n_clicks, tab, compare, method, n_stocks, lookback_m):
         strat = MomentumStrategy(lookback_long=lb_days, num_stocks=n_stocks)
 
         if n_clicks:
-            eq, st, hold = strat.backtest(prices, bench_returns["SP500"], method=method)
-            cur_results = {**results, method: eq}
-            cur_stats = {**all_stats, method: st}
-            cur_holdings = {**all_holdings, method: hold}
+            # Re-run ALL methods with the selected lookback + portfolio size
+            cur_results = {}
+            cur_stats = {}
+            cur_holdings = {}
+            for m in METHODS:
+                eq, st, hold = strat.backtest(prices, bench_returns["SP500"], method=m)
+                cur_results[m] = eq
+                cur_stats[m] = st
+                cur_holdings[m] = hold
+            cur_results["S&P 500"] = results["S&P 500"]
+            cur_stats["S&P 500"] = all_stats["S&P 500"]
+            cur_holdings["S&P 500"] = all_holdings.get("S&P 500", pd.DataFrame())
         else:
             cur_results, cur_stats, cur_holdings = results, all_stats, all_holdings
 
@@ -991,24 +1011,37 @@ def update_dashboard(n_clicks, tab, compare, method, n_stocks, lookback_m):
         elif tab == "tab-signals":
             content = tab_signals(strat, method)
         elif tab == "tab-sweep":
-            content = tab_sweep()
+            content = tab_sweep(strat)
         elif tab == "tab-ml":
-            content = tab_ml()
+            content = tab_ml(strat)
         elif tab == "tab-portfolio":
             content = tab_portfolio(strat, method, cur_holdings)
         else:
             content = html.Div("Select a tab above.")
 
-        return kpis, content
+        lb_months = round(lookback_m)
+        subtitle = (
+            f"S&P 500 · {prices.index[0].date()} → {prices.index[-1].date()} · "
+            f"{prices.shape[1]} clean tickers · lookback: {lb_months}m · {n_stocks} stocks"
+        )
+        return kpis, content, subtitle
 
     except Exception as e:
         import traceback
 
         error_msg = traceback.format_exc()
         print(error_msg)
-        return [], html.Pre(
-            error_msg,
-            style={"color": "red", "fontSize": "11px", "whiteSpace": "pre-wrap"},
+        subtitle_default = (
+            f"S&P 500 · {prices.index[0].date()} → {prices.index[-1].date()} · "
+            f"{prices.shape[1]} clean tickers"
+        )
+        return (
+            [],
+            html.Pre(
+                error_msg,
+                style={"color": "red", "fontSize": "11px", "whiteSpace": "pre-wrap"},
+            ),
+            subtitle_default,
         )
 
 
@@ -1251,6 +1284,7 @@ def tab_risk(cur_results, cur_stats, active):
 
 
 def tab_signals(strat, method):
+    lb_months = round(strat.lookback_long / 21)
     # Momentum score distribution
     scores = strat.calculate_momentum_score(prices, latest_date).sort_values()
     fig1 = go.Figure()
@@ -1266,8 +1300,8 @@ def tab_signals(strat, method):
     fig1.add_vline(x=0, line_dash="dot", line_color=GREY)
     fig1.update_layout(
         **PLOTLY_LAYOUT,
-        title="Classic 12-1 Momentum Score Distribution",
-        xaxis_title="12-1 Month Return (%)",
+        title=f"Momentum Score Distribution — {lb_months}m Lookback",
+        xaxis_title=f"{lb_months}-Month Return (%)",
         height=280,
     )
 
@@ -1286,14 +1320,14 @@ def tab_signals(strat, method):
     )
     fig2.update_layout(
         **PLOTLY_LAYOUT,
-        title="Top 10 Winners vs Bottom 10 Losers",
-        xaxis_title="12-1 Month Return (%)",
+        title=f"Top 10 Winners vs Bottom 10 Losers — {lb_months}m Lookback",
+        xaxis_title=f"{lb_months}-Month Return (%)",
         height=400,
     )
 
-    # Method overlap heatmap
+    # Method overlap heatmap — use strat params for consistency
     selections = {
-        m: set(strategy.select_stocks(prices, latest_date, method=m)) for m in METHODS
+        m: set(strat.select_stocks(prices, latest_date, method=m)) for m in METHODS
     }
     overlap = [[len(selections[a] & selections[b]) for b in METHODS] for a in METHODS]
     labels = [METHOD_LABELS[m] for m in METHODS]
@@ -1310,7 +1344,7 @@ def tab_signals(strat, method):
     )
     fig3.update_layout(
         **PLOTLY_LAYOUT,
-        title=f"Stock Overlap Between Signal Methods (Top {NUM_STOCKS})",
+        title=f"Stock Overlap Between Signal Methods (Top {strat.num_stocks})",
         height=320,
     )
 
@@ -1373,13 +1407,16 @@ def tab_signals(strat, method):
     )
 
 
-def tab_sweep():
-    # Lookback sweep (precomputed from module-level results using classic method)
+def tab_sweep(strat):
+    lb_months = round(strat.lookback_long / 21)
+    n_stocks = strat.num_stocks
+
+    # Lookback sweep — hold portfolio size fixed at selected value
     lookbacks_days = [21, 42, 63, 126, 189, 252, 315]
     sweep_rows = []
     for lb in lookbacks_days:
         s = MomentumStrategy(
-            lookback_long=lb, lookback_skip=min(21, lb // 4), num_stocks=NUM_STOCKS
+            lookback_long=lb, lookback_skip=min(21, lb // 4), num_stocks=n_stocks
         )
         try:
             eq, st, _ = s.backtest(prices, bench_returns["SP500"], method="classic")
@@ -1413,19 +1450,28 @@ def tab_sweep():
             row=1,
             col=col_i,
         )
-        fig1.add_vline(x=12, line_dash="dot", line_color=GREY, row=1, col=col_i)
+        # Mark the currently selected lookback
+        fig1.add_vline(
+            x=lb_months,
+            line_dash="dot",
+            line_color=ACCENT,
+            annotation_text=f"Selected: {lb_months}m",
+            annotation_font_color=ACCENT,
+            row=1,
+            col=col_i,
+        )
     fig1.update_layout(
         **PLOTLY_LAYOUT,
-        title="Lookback Window Sensitivity — Classic Momentum",
+        title=f"Lookback Window Sensitivity — Classic Momentum (portfolio size = {n_stocks})",
         height=320,
     )
     fig1.update_xaxes(gridcolor="#2a2f45", title_text="Lookback (months)")
     fig1.update_yaxes(gridcolor="#2a2f45")
 
-    # Portfolio size sweep
+    # Portfolio size sweep — hold lookback fixed at selected value
     n_range, n_rows = [5, 10, 15, 20, 30, 50], []
     for n in n_range:
-        s = MomentumStrategy(num_stocks=n)
+        s = MomentumStrategy(lookback_long=strat.lookback_long, num_stocks=n)
         try:
             eq, st, _ = s.backtest(prices, bench_returns["SP500"], method="composite")
             n_rows.append({"n_stocks": n, **st})
@@ -1464,12 +1510,87 @@ def tab_sweep():
             marker=dict(size=7),
         )
     )
+    fig2.add_vline(
+        x=n_stocks,
+        line_dash="dot",
+        line_color=ACCENT,
+        annotation_text=f"Selected: {n_stocks}",
+        annotation_font_color=ACCENT,
+    )
     fig2.update_layout(
         **PLOTLY_LAYOUT,
-        title="Portfolio Size Sensitivity — Composite Momentum",
+        title=f"Portfolio Size Sensitivity — Composite Momentum (lookback = {lb_months}m)",
         xaxis_title="# Stocks",
         height=300,
     )
+
+    # ── Dynamic Key Findings from actual sweep data ──────────────────────────
+    findings = []
+
+    if not sweep_df.empty and "Sharpe Ratio" in sweep_df.columns:
+        best_lb_row = sweep_df.loc[sweep_df["Sharpe Ratio"].idxmax()]
+        worst_lb_row = sweep_df.loc[sweep_df["Sharpe Ratio"].idxmin()]
+        best_lb_m = int(best_lb_row["lookback_months"])
+        worst_lb_m = int(worst_lb_row["lookback_months"])
+        best_lb_sr = round(best_lb_row["Sharpe Ratio"], 2)
+        cur_sr_lb = sweep_df.loc[
+            sweep_df["lookback_months"] == lb_months, "Sharpe Ratio"
+        ]
+        cur_str = (
+            f" Your selected {lb_months}m lookback has Sharpe {round(cur_sr_lb.values[0], 2)}."
+            if len(cur_sr_lb)
+            else ""
+        )
+
+        findings.append(
+            f"Best lookback in this sweep: {best_lb_m}m (Sharpe {best_lb_sr}). "
+            f"Worst: {worst_lb_m}m (Sharpe {round(worst_lb_row['Sharpe Ratio'], 2)}).{cur_str}"
+        )
+
+        short_lb = sweep_df[sweep_df["lookback_months"] <= 3]["Sharpe Ratio"].mean()
+        long_lb = sweep_df[sweep_df["lookback_months"] >= 12]["Sharpe Ratio"].mean()
+        if short_lb < long_lb:
+            findings.append(
+                f"Short lookbacks (≤3m) average Sharpe {round(short_lb, 2)} vs "
+                f"long lookbacks (≥12m) at {round(long_lb, 2)} — longer signals outperform at {n_stocks} stocks."
+            )
+        else:
+            findings.append(
+                f"Short lookbacks (≤3m) average Sharpe {round(short_lb, 2)} vs "
+                f"long lookbacks (≥12m) at {round(long_lb, 2)} — shorter signals outperform at {n_stocks} stocks."
+            )
+
+    if not n_df.empty and "Sharpe Ratio" in n_df.columns:
+        best_n_row = n_df.loc[n_df["Sharpe Ratio"].idxmax()]
+        best_n = int(best_n_row["n_stocks"])
+        best_n_sr = round(best_n_row["Sharpe Ratio"], 2)
+        cur_n_sr = n_df.loc[n_df["n_stocks"] == n_stocks, "Sharpe Ratio"]
+        cur_n_str = (
+            f" Your selected {n_stocks} stocks has Sharpe {round(cur_n_sr.values[0], 2)}."
+            if len(cur_n_sr)
+            else ""
+        )
+        findings.append(
+            f"Optimal portfolio size at {lb_months}m lookback: {best_n} stocks (Sharpe {best_n_sr}).{cur_n_str}"
+        )
+
+        small = n_df[n_df["n_stocks"] <= 10]["Sharpe Ratio"].mean()
+        large = n_df[n_df["n_stocks"] >= 30]["Sharpe Ratio"].mean()
+        if small < large:
+            findings.append(
+                f"Concentrated portfolios (≤10 stocks, avg Sharpe {round(small, 2)}) "
+                f"underperform diversified ones (≥30 stocks, avg Sharpe {round(large, 2)}) at this lookback."
+            )
+        else:
+            findings.append(
+                f"Concentrated portfolios (≤10 stocks, avg Sharpe {round(small, 2)}) "
+                f"outperform diversified ones (≥30 stocks, avg Sharpe {round(large, 2)}) at this lookback."
+            )
+
+    if not findings:
+        findings = [
+            "Insufficient data to generate findings — try running the backtest first."
+        ]
 
     return html.Div(
         [
@@ -1479,7 +1600,7 @@ def tab_sweep():
                 html.Div(
                     [
                         html.P(
-                            "💡 Key Findings",
+                            f"💡 Key Findings — {lb_months}m lookback, {n_stocks} stocks",
                             style={
                                 "color": ACCENT,
                                 "fontWeight": "700",
@@ -1487,17 +1608,7 @@ def tab_sweep():
                             },
                         ),
                         html.Ul(
-                            [
-                                html.Li(
-                                    "Sharpe peaks around the 6–12 month lookback range — the academic rule is empirically supported."
-                                ),
-                                html.Li(
-                                    "Very short lookbacks (<3m) and very long (>15m) both underperform the 12m standard."
-                                ),
-                                html.Li(
-                                    "Portfolio size of 15–25 stocks offers the best Sharpe; below 10 adds idiosyncratic risk."
-                                ),
-                            ],
+                            [html.Li(f) for f in findings],
                             style={"color": TXT_MUTE, "fontSize": "13px"},
                         ),
                     ]
@@ -1507,7 +1618,8 @@ def tab_sweep():
     )
 
 
-def tab_ml():
+def tab_ml(strat=None):
+    n_picks = strat.num_stocks if strat is not None else NUM_STOCKS
     # Model comparison bar
     model_names = list(ml_results.keys())
     mae_vals = [ml_results[n]["test_mae"] for n in model_names]
@@ -1605,7 +1717,7 @@ def tab_ml():
     feat_today["skew_3m"] = ret_w.skew()
     feat_today = feat_today[FEATURE_COLS].dropna()
     ml_scores = pd.Series(xgb_model.predict(feat_today.values), index=feat_today.index)
-    top_ml = ml_scores.nlargest(20).reset_index()
+    top_ml = ml_scores.nlargest(n_picks).reset_index()
     top_ml.columns = ["Ticker", "Predicted Next-Month Return"]
     top_ml["Sector"] = sector_map.reindex(top_ml["Ticker"])["gics_sector"].values
     top_ml["Predicted Next-Month Return"] = (
@@ -1755,7 +1867,7 @@ def tab_ml():
             card(
                 [
                     html.P(
-                        f"🤖 XGBoost Top-20 Picks — {latest_date.date()}",
+                        f"🤖 XGBoost Top-{n_picks} Picks — {latest_date.date()}",
                         style={
                             "color": ACCENT,
                             "fontWeight": "700",
@@ -1795,7 +1907,7 @@ def tab_ml():
                                                     "Survivorship bias: the S&P 500 constituent list reflects today’s survivors. Stocks delisted or removed historically are excluded, overstating returns."
                                                 ),
                                                 html.Li(
-                                                    "Transaction costs & market impact are not modelled. Monthly rebalancing of 20 stocks incurs bid-ask spreads and slippage, particularly for less liquid names."
+                                                    f"Transaction costs & market impact are not modelled. Monthly rebalancing of {n_picks} stocks incurs bid-ask spreads and slippage, particularly for less liquid names."
                                                 ),
                                                 html.Li(
                                                     "The 70% data availability threshold is pragmatic — tickers with sparse data may still introduce look-ahead bias through forward-fill."
@@ -1910,7 +2022,7 @@ def tab_portfolio(strat, method, cur_holdings):
     )
 
     # Recent returns of picks
-    ret_30d = (prices.iloc[-1] / prices.iloc[-22] - 1).reindex(
+    ret_30d = (prices.iloc[-1] / prices.iloc[-21] - 1).reindex(
         picks
     ).sort_values() * 100
     fig2 = go.Figure(
@@ -1935,17 +2047,17 @@ def tab_portfolio(strat, method, cur_holdings):
             "Company": sector_map.reindex(picks)["company"].values,
             "Sector": sector_map.reindex(picks)["gics_sector"].values,
             "Weight %": [round(100 / len(picks), 1)] * len(picks),
-            "Ret 1M %": (prices.iloc[-1] / prices.iloc[-22] - 1)
+            "Ret 1M %": (prices.iloc[-1] / prices.iloc[-21] - 1)
             .reindex(picks)
             .round(4)
             .values
             * 100,
-            "Ret 3M %": (prices.iloc[-1] / prices.iloc[-64] - 1)
+            "Ret 3M %": (prices.iloc[-1] / prices.iloc[-63] - 1)
             .reindex(picks)
             .round(4)
             .values
             * 100,
-            "Ret 12M %": (prices.iloc[-1] / prices.iloc[-253] - 1)
+            "Ret 12M %": (prices.iloc[-1] / prices.iloc[-252] - 1)
             .reindex(picks)
             .round(4)
             .values
@@ -2006,7 +2118,7 @@ def tab_portfolio(strat, method, cur_holdings):
             card(
                 [
                     html.P(
-                        f"📋 Live Portfolio Holdings — {latest_date.date()} · Method: {METHOD_LABELS[method]}",
+                        f"📋 Live Portfolio Holdings — {latest_date.date()} · Method: {METHOD_LABELS[method]} · {round(strat.lookback_long / 21)}m lookback · {strat.num_stocks} stocks",
                         style={
                             "color": ACCENT,
                             "fontWeight": "700",
